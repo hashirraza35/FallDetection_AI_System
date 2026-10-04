@@ -10,7 +10,6 @@ import numpy as np
 import threading
 import uuid
 import hmac
-
 from pathlib import Path
 
 from src.browser_inference import (
@@ -25,7 +24,6 @@ from src.browser_inference import (
 # ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-
 DASHBOARD_DIR = PROJECT_ROOT / "DASHBOARD"
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 
@@ -55,7 +53,7 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(
     __name__,
-    static_folder=DASHBOARD_DIR,
+    static_folder=str(DASHBOARD_DIR),
     static_url_path=""
 )
 
@@ -126,11 +124,9 @@ def check_origin():
     """
     Same-origin protection.
 
-    This is intentionally kept simple for the current
-    Render-hosted dashboard.
-
-    Later, when frontend is moved to Vercel, this can be
-    expanded to allow the Vercel domain.
+    Current Render-hosted dashboard is allowed.
+    When frontend moves to Vercel, the Vercel origin
+    can be added here.
     """
 
     origin = get_request_origin()
@@ -157,7 +153,6 @@ def check_origin():
 def check_basic_auth():
     """
     Optional HTTP Basic authentication.
-
     Disabled by default.
     """
 
@@ -185,7 +180,7 @@ def check_basic_auth():
 @app.before_request
 def security_check():
 
-    # OPTIONS requests are allowed for future CORS/preflight use.
+    # OPTIONS requests are allowed for future CORS/preflight.
     if request.method == "OPTIONS":
         return None
 
@@ -208,6 +203,7 @@ def security_check():
         })
 
         response.status_code = 401
+
         response.headers["WWW-Authenticate"] = (
             'Basic realm="FallDetection.AI"'
         )
@@ -228,7 +224,9 @@ def add_security_headers(response):
 
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
 
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Referrer-Policy"] = (
+        "strict-origin-when-cross-origin"
+    )
 
     response.headers["Permissions-Policy"] = (
         "camera=(self), microphone=()"
@@ -373,9 +371,13 @@ def get_alerts():
     history = load_alert_history()
 
     return jsonify({
+
         "success": True,
+
         "alerts": list(reversed(history)),
+
         "count": len(history),
+
     })
 
 
@@ -411,19 +413,55 @@ def start_monitoring():
     global current_session_id
     global last_legacy_frame_saved_at
 
+    print(
+        "========================================",
+        flush=True
+    )
+
+    print(
+        "START DEBUG | REQUEST RECEIVED",
+        flush=True
+    )
+
+    print(
+        "START DEBUG | PID=",
+        os.getpid(),
+        "| THREAD=",
+        threading.get_ident(),
+        flush=True
+    )
+
+    print(
+        "START DEBUG | Previous running=",
+        system_state["running"],
+        "| Previous session=",
+        current_session_id,
+        flush=True
+    )
+
     with process_lock:
 
-        new_session_id = str(
-            uuid.uuid4()
-        )
+        # ----------------------------------------------------
+        # CREATE NEW SESSION
+        # ----------------------------------------------------
+
+        new_session_id = str(uuid.uuid4())
 
         with session_lock:
 
             current_session_id = new_session_id
 
+        # ----------------------------------------------------
+        # RESET AI INFERENCE
+        # ----------------------------------------------------
+
         reset_inference()
 
         last_legacy_frame_saved_at = 0.0
+
+        # ----------------------------------------------------
+        # REMOVE OLD LIVE FRAME
+        # ----------------------------------------------------
 
         try:
 
@@ -438,6 +476,10 @@ def start_monitoring():
                 error,
                 flush=True
             )
+
+        # ----------------------------------------------------
+        # RESET SYSTEM STATE
+        # ----------------------------------------------------
 
         system_state["alert_count"] = (
             get_persistent_alert_count()
@@ -455,10 +497,26 @@ def start_monitoring():
             else "Not configured"
         )
 
-    print(
-        "========================================",
-        flush=True
-    )
+        # ----------------------------------------------------
+        # IMPORTANT DEBUG
+        # ----------------------------------------------------
+
+        with session_lock:
+
+            debug_active_session = current_session_id
+
+        print(
+            "START DEBUG AFTER STATE SET |",
+            "running=",
+            system_state["running"],
+            "| session=",
+            debug_active_session,
+            "| PID=",
+            os.getpid(),
+            "| THREAD=",
+            threading.get_ident(),
+            flush=True
+        )
 
     print(
         "Browser monitoring started.",
@@ -521,6 +579,7 @@ def get_jpeg_dimensions(image_bytes):
                 index < len(image_bytes)
                 and image_bytes[index] == 0xFF
             ):
+
                 index += 1
 
             if index >= len(image_bytes):
@@ -535,6 +594,7 @@ def get_jpeg_dimensions(image_bytes):
                 0x01,
                 *range(0xD0, 0xD9),
             }:
+
                 continue
 
             if index + 1 >= len(image_bytes):
@@ -607,22 +667,30 @@ def receive_frame():
 
     global last_legacy_frame_saved_at
 
-    # ========================================================
-    # DEBUG 1 — VERY IMPORTANT
-    # ========================================================
-
     print(
         "----------------------------------------",
         flush=True
     )
 
+    # ========================================================
+    # DEBUG
+    # ========================================================
+
+    with session_lock:
+        debug_active_session = current_session_id
+
     print(
-        "FRAME DEBUG | running=",
+        "FRAME DEBUG |",
+        "running=",
         system_state["running"],
         "| request_session=",
         request.form.get("session_id"),
         "| active_session=",
-        current_session_id,
+        debug_active_session,
+        "| PID=",
+        os.getpid(),
+        "| THREAD=",
+        threading.get_ident(),
         flush=True
     )
 
@@ -641,7 +709,8 @@ def receive_frame():
     if not system_state["running"]:
 
         print(
-            "FRAME DEBUG RESULT | Monitoring is NOT running.",
+            "FRAME DEBUG RESULT | "
+            "Monitoring is NOT running.",
             flush=True
         )
 
@@ -668,7 +737,8 @@ def receive_frame():
         active_session_id = current_session_id
 
     print(
-        "SESSION DEBUG | request=",
+        "SESSION DEBUG |",
+        "request=",
         request_session_id,
         "| active=",
         active_session_id,
@@ -683,7 +753,8 @@ def receive_frame():
     ):
 
         print(
-            "FRAME DEBUG RESULT | EXPIRED SESSION.",
+            "FRAME DEBUG RESULT | "
+            "EXPIRED SESSION.",
             flush=True
         )
 
@@ -710,7 +781,8 @@ def receive_frame():
         if "frame" not in request.files:
 
             print(
-                "FRAME DEBUG RESULT | No frame received.",
+                "FRAME DEBUG RESULT | "
+                "No frame received.",
                 flush=True
             )
 
@@ -739,7 +811,8 @@ def receive_frame():
         if file.mimetype != "image/jpeg":
 
             print(
-                "FRAME DEBUG RESULT | Invalid MIME type.",
+                "FRAME DEBUG RESULT | "
+                "Invalid MIME type.",
                 file.mimetype,
                 flush=True
             )
@@ -764,7 +837,8 @@ def receive_frame():
         if not image_bytes:
 
             print(
-                "FRAME DEBUG RESULT | Empty frame.",
+                "FRAME DEBUG RESULT | "
+                "Empty frame.",
                 flush=True
             )
 
@@ -793,7 +867,8 @@ def receive_frame():
         if dimensions is None:
 
             print(
-                "FRAME DEBUG RESULT | Invalid JPEG.",
+                "FRAME DEBUG RESULT | "
+                "Invalid JPEG.",
                 flush=True
             )
 
@@ -829,7 +904,8 @@ def receive_frame():
         ):
 
             print(
-                "FRAME DEBUG RESULT | Frame dimensions rejected.",
+                "FRAME DEBUG RESULT | "
+                "Frame dimensions rejected.",
                 flush=True
             )
 
@@ -863,7 +939,8 @@ def receive_frame():
         if frame is None:
 
             print(
-                "FRAME DEBUG RESULT | OpenCV decode failed.",
+                "FRAME DEBUG RESULT | "
+                "OpenCV decode failed.",
                 flush=True
             )
 
@@ -899,7 +976,8 @@ def receive_frame():
         ) != dimensions:
 
             print(
-                "FRAME DEBUG RESULT | JPEG dimensions mismatch.",
+                "FRAME DEBUG RESULT | "
+                "JPEG dimensions mismatch.",
                 flush=True
             )
 
@@ -920,9 +998,9 @@ def receive_frame():
 
         with process_lock:
 
-            # -----------------------------------------------
+            # ------------------------------------------------
             # RUNNING CHECK AGAIN
-            # -----------------------------------------------
+            # ------------------------------------------------
 
             if not system_state["running"]:
 
@@ -942,9 +1020,9 @@ def receive_frame():
 
                 }), 409
 
-            # -----------------------------------------------
+            # ------------------------------------------------
             # SESSION CHECK AGAIN
-            # -----------------------------------------------
+            # ------------------------------------------------
 
             with session_lock:
 
@@ -953,7 +1031,8 @@ def receive_frame():
                 )
 
             print(
-                "LOCKED SESSION DEBUG | request=",
+                "LOCKED SESSION DEBUG |",
+                "request=",
                 request_session_id,
                 "| active=",
                 active_session_id,
@@ -983,16 +1062,14 @@ def receive_frame():
 
                 }), 409
 
-            # -----------------------------------------------
+            # ------------------------------------------------
             # LEGACY FRAME SAVE DECISION
-            # -----------------------------------------------
+            # ------------------------------------------------
 
             include_legacy_frame = (
-
                 time.monotonic()
                 - last_legacy_frame_saved_at
                 >= LEGACY_FRAME_INTERVAL_SECONDS
-
             )
 
             print(
@@ -1003,18 +1080,15 @@ def receive_frame():
                 flush=True
             )
 
-            # -----------------------------------------------
+            # ------------------------------------------------
             # AI INFERENCE
-            # -----------------------------------------------
+            # ------------------------------------------------
 
             result = process_frame(
-
                 frame,
-
                 include_frame=(
                     include_legacy_frame
                 )
-
             )
 
             print(
@@ -1027,9 +1101,9 @@ def receive_frame():
                 flush=True
             )
 
-            # -----------------------------------------------
+            # ------------------------------------------------
             # UPDATE LEGACY FRAME TIMER
-            # -----------------------------------------------
+            # ------------------------------------------------
 
             if result.get("frame") is not None:
 
@@ -1170,6 +1244,29 @@ def stop_monitoring():
 
     global current_session_id
 
+    print(
+        "========================================",
+        flush=True
+    )
+
+    print(
+        "STOP DEBUG | REQUEST RECEIVED",
+        flush=True
+    )
+
+    print(
+        "STOP DEBUG | BEFORE |",
+        "running=",
+        system_state["running"],
+        "| session=",
+        current_session_id,
+        "| PID=",
+        os.getpid(),
+        "| THREAD=",
+        threading.get_ident(),
+        flush=True
+    )
+
     with process_lock:
 
         with session_lock:
@@ -1197,7 +1294,25 @@ def stop_monitoring():
         )
 
     print(
+        "STOP DEBUG | AFTER |",
+        "running=",
+        system_state["running"],
+        "| session=",
+        current_session_id,
+        "| PID=",
+        os.getpid(),
+        "| THREAD=",
+        threading.get_ident(),
+        flush=True
+    )
+
+    print(
         "Browser monitoring stopped.",
+        flush=True
+    )
+
+    print(
+        "========================================",
         flush=True
     )
 
@@ -1208,6 +1323,35 @@ def stop_monitoring():
         "message": (
             "Browser monitoring stopped."
         )
+
+    })
+
+
+# ============================================================
+# DEBUG STATE API
+# ============================================================
+
+@app.route("/api/debug/state", methods=["GET"])
+def debug_state():
+
+    with session_lock:
+        active_session = current_session_id
+
+    return jsonify({
+
+        "success": True,
+
+        "running": system_state["running"],
+
+        "status": system_state["status"],
+
+        "detection": system_state["detection"],
+
+        "session_id": active_session,
+
+        "pid": os.getpid(),
+
+        "thread": threading.get_ident(),
 
     })
 
@@ -1285,13 +1429,19 @@ def video_feed():
                         frame_data = file.read()
 
                     yield (
+
                         b"--frame\r\n"
+
                         b"Content-Type: image/jpeg\r\n\r\n"
+
                         + frame_data
+
                         + b"\r\n"
+
                     )
 
                 except Exception:
+
                     pass
 
             time.sleep(
@@ -1334,8 +1484,11 @@ def dashboard():
         }), 404
 
     return send_from_directory(
+
         DASHBOARD_DIR,
+
         "index.html"
+
     )
 
 
@@ -1353,11 +1506,17 @@ def dashboard_static(path):
         DASHBOARD_DIR / path
     )
 
-    if requested_path.exists() and requested_path.is_file():
+    if (
+        requested_path.exists()
+        and requested_path.is_file()
+    ):
 
         return send_from_directory(
+
             DASHBOARD_DIR,
+
             path
+
         )
 
     return jsonify({
