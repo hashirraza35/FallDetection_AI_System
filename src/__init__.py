@@ -1,0 +1,1 @@
+"""FallDetection.AI application package."""
