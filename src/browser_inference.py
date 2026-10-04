@@ -4,6 +4,7 @@ import math
 import numpy as np
 import mediapipe as mp
 import threading
+import time
 from pathlib import Path
 
 from .alert_agent import AlertResponseAgent
@@ -23,7 +24,7 @@ MODEL_PATH = PROJECT_ROOT / "models" / "fall_detection_model.pkl"
 
 model = joblib.load(MODEL_PATH)
 
-print("Browser inference ML model loaded successfully.")
+print("Browser inference ML model loaded successfully.", flush=True)
 
 fall_class_indices = np.flatnonzero(
     np.asarray(model.classes_) == 1
@@ -35,6 +36,7 @@ if len(fall_class_indices) != 1:
     )
 
 FALL_CLASS_INDEX = int(fall_class_indices[0])
+
 
 # ============================================================
 # MEDIAPIPE
@@ -56,6 +58,8 @@ pose = mp_pose.Pose(
 # ============================================================
 
 SEQUENCE_LENGTH = 30
+
+# Run ML model every 2 processed frames after buffer is ready.
 MODEL_PREDICTION_INTERVAL = 2
 
 frame_buffer = []
@@ -65,14 +69,43 @@ fall_latched = False
 fall_trigger_counter = 0
 heuristic_trigger_counter = 0
 alert_sent_for_current_fall = False
+
 frames_since_model_prediction = 0
 model_prediction_count = 0
+
 last_ml_fall_prob = 0.0
 last_logged_buffer_size = 0
 
 alert_agent = AlertResponseAgent()
 
 state_lock = threading.Lock()
+
+
+# ============================================================
+# DIAGNOSTIC CONFIG
+# ============================================================
+
+DIAGNOSTIC_ENABLED = True
+
+# Prevent terminal from being flooded.
+diagnostic_frame_counter = 0
+
+# Print full timing details for first few frames,
+# then every 10th frame.
+DIAGNOSTIC_VERBOSE_FRAMES = 5
+DIAGNOSTIC_INTERVAL = 10
+
+
+# ============================================================
+# HELPER: DIAGNOSTIC LOG
+# ============================================================
+
+def diagnostic_log(message):
+    if DIAGNOSTIC_ENABLED:
+        print(
+            f"[INFERENCE DIAGNOSTIC] {message}",
+            flush=True
+        )
 
 
 # ============================================================
@@ -92,17 +125,23 @@ def calculate_angle(p1, p2):
 
 
 # ============================================================
-# PROCESS FRAME
+# ALERT
 # ============================================================
 
 def _send_alert_in_background(confidence):
     try:
+        print(
+            f"[ALERT] Starting background alert | confidence={confidence}",
+            flush=True
+        )
+
         alert_agent.create_alert(
             camera_name="Browser Camera",
             confidence=confidence
         )
 
         alerts = alert_agent.get_alert_history()
+
         telegram_status = (
             alerts[-1].get("telegram_status", "FAILED")
             if alerts
@@ -110,18 +149,27 @@ def _send_alert_in_background(confidence):
         )
 
         if telegram_status == "SENT":
-            print("[ALERT] Telegram success")
+            print(
+                "[ALERT] Telegram success",
+                flush=True
+            )
         else:
             print(
-                f"[ALERT] Telegram {telegram_status.lower()}"
+                f"[ALERT] Telegram {telegram_status.lower()}",
+                flush=True
             )
 
     except Exception as error:
         print(
             "[ALERT] Alert agent error:",
-            error
+            error,
+            flush=True
         )
 
+
+# ============================================================
+# PROCESS FRAME
+# ============================================================
 
 def process_frame(frame, include_frame=True):
 
@@ -129,10 +177,17 @@ def process_frame(frame, include_frame=True):
     global fall_trigger_counter
     global heuristic_trigger_counter
     global alert_sent_for_current_fall
+
     global frames_since_model_prediction
     global model_prediction_count
     global last_ml_fall_prob
     global last_logged_buffer_size
+
+    global diagnostic_frame_counter
+
+    # --------------------------------------------------------
+    # FRAME VALIDATION
+    # --------------------------------------------------------
 
     if frame is None:
         return {
@@ -144,34 +199,93 @@ def process_frame(frame, include_frame=True):
             "landmarks": []
         }
 
+    diagnostic_frame_counter += 1
+
+    current_frame_number = diagnostic_frame_counter
+
+    should_log_diagnostic = (
+        current_frame_number <= DIAGNOSTIC_VERBOSE_FRAMES
+        or current_frame_number % DIAGNOSTIC_INTERVAL == 0
+    )
+
+    total_start = time.perf_counter()
+
+    if should_log_diagnostic:
+        diagnostic_log(
+            f"FRAME {current_frame_number} | START | "
+            f"shape={frame.shape} | "
+            f"dtype={frame.dtype}"
+        )
+
+    # ========================================================
+    # STATE LOCK
+    # ========================================================
+
     with state_lock:
 
         # ====================================================
-        # CONVERT BGR → RGB
+        # STEP 1 — BGR → RGB
         # ====================================================
+
+        step_start = time.perf_counter()
 
         rgb_frame = cv2.cvtColor(
             frame,
             cv2.COLOR_BGR2RGB
         )
 
+        step_time = time.perf_counter() - step_start
+
+        if should_log_diagnostic:
+            diagnostic_log(
+                f"FRAME {current_frame_number} | "
+                f"STEP 1 cvtColor | {step_time:.4f}s"
+            )
+
+        # ====================================================
+        # STEP 2 — MEDIAPIPE
+        # ====================================================
+
+        step_start = time.perf_counter()
+
+        if should_log_diagnostic:
+            diagnostic_log(
+                f"FRAME {current_frame_number} | "
+                f"STEP 2 pose.process START"
+            )
+
         results = pose.process(rgb_frame)
+
+        step_time = time.perf_counter() - step_start
+
+        if should_log_diagnostic:
+            diagnostic_log(
+                f"FRAME {current_frame_number} | "
+                f"STEP 2 pose.process END | {step_time:.4f}s | "
+                f"person={bool(results.pose_landmarks)}"
+            )
+
+        # ====================================================
+        # INITIAL VALUES
+        # ====================================================
 
         ml_fall_prob = (
             last_ml_fall_prob
             if len(frame_buffer) >= SEQUENCE_LENGTH
             else 0.0
         )
+
         person_detected = False
 
         torso_angle = 0.0
         downward_velocity = 0.0
 
         landmarks_for_browser = []
+
         model_prediction_updated = False
+
         fall_candidate = False
         alert_triggered = False
-
 
         # ====================================================
         # PERSON DETECTED
@@ -183,13 +297,19 @@ def process_frame(frame, include_frame=True):
 
             lms = results.pose_landmarks.landmark
 
+            if should_log_diagnostic:
+                diagnostic_log(
+                    f"FRAME {current_frame_number} | "
+                    f"PERSON DETECTED | landmarks={len(lms)}"
+                )
 
-            # ------------------------------------------------
-            # SEND LANDMARKS TO BROWSER
-            # ------------------------------------------------
+            # =================================================
+            # STEP 3 — LANDMARK SERIALIZATION
+            # =================================================
+
+            step_start = time.perf_counter()
 
             for lm in lms:
-
                 landmarks_for_browser.append({
                     "x": float(lm.x),
                     "y": float(lm.y),
@@ -197,60 +317,61 @@ def process_frame(frame, include_frame=True):
                     "visibility": float(lm.visibility)
                 })
 
+            step_time = time.perf_counter() - step_start
 
-            # ------------------------------------------------
+            if should_log_diagnostic:
+                diagnostic_log(
+                    f"FRAME {current_frame_number} | "
+                    f"STEP 3 landmarks | {step_time:.4f}s"
+                )
+
+            # =================================================
             # SHOULDERS
-            # ------------------------------------------------
+            # =================================================
+
+            left_shoulder = lms[
+                mp_pose.PoseLandmark.LEFT_SHOULDER
+            ]
+
+            right_shoulder = lms[
+                mp_pose.PoseLandmark.RIGHT_SHOULDER
+            ]
 
             left_s = [
-                lms[
-                    mp_pose.PoseLandmark.LEFT_SHOULDER
-                ].x,
-
-                lms[
-                    mp_pose.PoseLandmark.LEFT_SHOULDER
-                ].y
+                left_shoulder.x,
+                left_shoulder.y
             ]
 
             right_s = [
-                lms[
-                    mp_pose.PoseLandmark.RIGHT_SHOULDER
-                ].x,
-
-                lms[
-                    mp_pose.PoseLandmark.RIGHT_SHOULDER
-                ].y
+                right_shoulder.x,
+                right_shoulder.y
             ]
 
-
-            # ------------------------------------------------
+            # =================================================
             # HIPS
-            # ------------------------------------------------
+            # =================================================
+
+            left_hip = lms[
+                mp_pose.PoseLandmark.LEFT_HIP
+            ]
+
+            right_hip = lms[
+                mp_pose.PoseLandmark.RIGHT_HIP
+            ]
 
             left_h = [
-                lms[
-                    mp_pose.PoseLandmark.LEFT_HIP
-                ].x,
-
-                lms[
-                    mp_pose.PoseLandmark.LEFT_HIP
-                ].y
+                left_hip.x,
+                left_hip.y
             ]
 
             right_h = [
-                lms[
-                    mp_pose.PoseLandmark.RIGHT_HIP
-                ].x,
-
-                lms[
-                    mp_pose.PoseLandmark.RIGHT_HIP
-                ].y
+                right_hip.x,
+                right_hip.y
             ]
 
-
-            # ------------------------------------------------
+            # =================================================
             # BODY CENTER
-            # ------------------------------------------------
+            # =================================================
 
             s_mid = [
                 (left_s[0] + right_s[0]) / 2.0,
@@ -262,29 +383,26 @@ def process_frame(frame, include_frame=True):
                 (left_h[1] + right_h[1]) / 2.0
             ]
 
-
-            # ------------------------------------------------
+            # =================================================
             # TORSO ANGLE
-            # ------------------------------------------------
+            # =================================================
 
             torso_angle = calculate_angle(
                 s_mid,
                 h_mid
             )
 
-
-            # ------------------------------------------------
+            # =================================================
             # NOSE
-            # ------------------------------------------------
+            # =================================================
 
             nose_y = lms[
                 mp_pose.PoseLandmark.NOSE
             ].y
 
-
-            # ------------------------------------------------
+            # =================================================
             # HEAD VELOCITY
-            # ------------------------------------------------
+            # =================================================
 
             head_y_history.append(nose_y)
 
@@ -297,15 +415,15 @@ def process_frame(frame, include_frame=True):
                     - head_y_history[0]
                 )
 
+            # =================================================
+            # STEP 4 — ML FEATURE EXTRACTION
+            # =================================================
 
-            # =================================================
-            # ML FEATURES
-            # =================================================
+            step_start = time.perf_counter()
 
             landmarks = []
 
             for lm in lms:
-
                 landmarks.extend([
                     lm.x,
                     lm.y,
@@ -313,13 +431,23 @@ def process_frame(frame, include_frame=True):
                 ])
 
             frame_buffer.append(landmarks)
+
             if len(frame_buffer) > SEQUENCE_LENGTH:
                 frame_buffer.pop(0)
 
             frames_since_model_prediction += 1
 
+            step_time = time.perf_counter() - step_start
+
+            if should_log_diagnostic:
+                diagnostic_log(
+                    f"FRAME {current_frame_number} | "
+                    f"STEP 4 features | {step_time:.4f}s | "
+                    f"buffer={len(frame_buffer)}/{SEQUENCE_LENGTH}"
+                )
+
             # =================================================
-            # ML PREDICTION
+            # STEP 5 — ML PREDICTION
             # =================================================
 
             ml_ready = (
@@ -335,12 +463,25 @@ def process_frame(frame, include_frame=True):
                 )
             ):
 
-                input_data = (
-                    np.asarray(
-                        frame_buffer,
-                        dtype=np.float32
-                    ).reshape(1, -1)
-                )
+                if should_log_diagnostic:
+                    diagnostic_log(
+                        f"FRAME {current_frame_number} | "
+                        f"STEP 5 model prediction START | "
+                        f"prediction_count={model_prediction_count}"
+                    )
+
+                step_start = time.perf_counter()
+
+                input_data = np.asarray(
+                    frame_buffer,
+                    dtype=np.float32
+                ).reshape(1, -1)
+
+                if should_log_diagnostic:
+                    diagnostic_log(
+                        f"FRAME {current_frame_number} | "
+                        f"MODEL INPUT shape={input_data.shape}"
+                    )
 
                 probabilities = model.predict_proba(
                     input_data
@@ -349,10 +490,23 @@ def process_frame(frame, include_frame=True):
                 ml_fall_prob = float(
                     probabilities[FALL_CLASS_INDEX]
                 )
+
                 last_ml_fall_prob = ml_fall_prob
+
                 frames_since_model_prediction = 0
                 model_prediction_count += 1
+
                 model_prediction_updated = True
+
+                step_time = time.perf_counter() - step_start
+
+                if should_log_diagnostic:
+                    diagnostic_log(
+                        f"FRAME {current_frame_number} | "
+                        f"STEP 5 model prediction END | "
+                        f"{step_time:.4f}s | "
+                        f"fall_probability={ml_fall_prob:.4f}"
+                    )
 
             buffer_size = min(
                 len(frame_buffer),
@@ -363,11 +517,13 @@ def process_frame(frame, include_frame=True):
                 buffer_size in (10, 20, 25, 30)
                 and buffer_size != last_logged_buffer_size
             ):
-                print(
-                    f"[FRAME] buffer={buffer_size}/{SEQUENCE_LENGTH}"
-                )
-                last_logged_buffer_size = buffer_size
 
+                print(
+                    f"[FRAME] buffer={buffer_size}/{SEQUENCE_LENGTH}",
+                    flush=True
+                )
+
+                last_logged_buffer_size = buffer_size
 
             # =================================================
             # FALL DETECTION
@@ -384,12 +540,14 @@ def process_frame(frame, include_frame=True):
             )
 
             if ml_ready:
+
                 if heuristic_fall:
                     heuristic_trigger_counter += 1
                 else:
                     heuristic_trigger_counter = 0
 
                 if model_prediction_updated:
+
                     if ml_fall:
                         fall_trigger_counter += 1
                     else:
@@ -410,13 +568,16 @@ def process_frame(frame, include_frame=True):
                         heuristic_trigger_counter
                     ) <= 2
                 ):
+
                     counter = max(
                         fall_trigger_counter,
                         heuristic_trigger_counter
                     )
+
                     print(
                         "[FALL] candidate=True "
-                        f"counter={counter}"
+                        f"counter={counter}",
+                        flush=True
                     )
 
                 if (
@@ -425,14 +586,21 @@ def process_frame(frame, include_frame=True):
                 ):
                     fall_latched = True
 
+            # =================================================
+            # MODEL LOGGING / RECOVERY
+            # =================================================
+
             if model_prediction_updated:
+
                 if (
                     model_prediction_count == 1
                     or model_prediction_count % 10 == 0
                 ):
+
                     print(
                         "[MODEL] ready=True "
-                        f"probability={ml_fall_prob:.2f}"
+                        f"probability={ml_fall_prob:.2f}",
+                        flush=True
                     )
 
                 is_standing_upright = (
@@ -446,22 +614,31 @@ def process_frame(frame, include_frame=True):
                     and not fall_candidate
                     and is_standing_upright
                 ):
+
                     fall_latched = False
+
                     fall_trigger_counter = 0
                     heuristic_trigger_counter = 0
+
                     alert_sent_for_current_fall = False
+
                     print(
-                        "[FALL] recovery detected; alert latch reset"
+                        "[FALL] recovery detected; "
+                        "alert latch reset",
+                        flush=True
                     )
 
         else:
 
-            # No person detected
+            # =================================================
+            # NO PERSON
+            # =================================================
+
             landmarks_for_browser = []
+
             if not fall_latched:
                 fall_trigger_counter = 0
                 heuristic_trigger_counter = 0
-
 
         # ====================================================
         # FALL RESULT
@@ -472,9 +649,16 @@ def process_frame(frame, include_frame=True):
             detection = "FALL DETECTED"
 
             if not alert_sent_for_current_fall:
+
                 alert_sent_for_current_fall = True
+
                 alert_triggered = True
-                print("[ALERT] Triggering alert")
+
+                print(
+                    "[ALERT] Triggering alert",
+                    flush=True
+                )
+
                 threading.Thread(
                     target=_send_alert_in_background,
                     args=(ml_fall_prob,),
@@ -488,18 +672,27 @@ def process_frame(frame, include_frame=True):
 
             alert_sent_for_current_fall = False
 
+        # ====================================================
+        # STEP 6 — DRAWING
+        # ====================================================
 
         if include_frame:
+
+            step_start = time.perf_counter()
+
             if results.pose_landmarks:
+
                 mp_drawing.draw_landmarks(
                     frame,
                     results.pose_landmarks,
                     mp_pose.POSE_CONNECTIONS,
+
                     mp_drawing.DrawingSpec(
                         color=(0, 255, 0),
                         thickness=2,
                         circle_radius=3
                     ),
+
                     mp_drawing.DrawingSpec(
                         color=(255, 255, 0),
                         thickness=2,
@@ -508,9 +701,12 @@ def process_frame(frame, include_frame=True):
                 )
 
             if fall_latched:
+
                 color = (0, 0, 255)
                 label = "FALL DETECTED"
+
             else:
+
                 color = (0, 255, 0)
                 label = "NORMAL ACTIVITY"
 
@@ -521,6 +717,7 @@ def process_frame(frame, include_frame=True):
                 (0, 0, 0),
                 -1
             )
+
             cv2.putText(
                 frame,
                 label,
@@ -530,6 +727,7 @@ def process_frame(frame, include_frame=True):
                 color,
                 2
             )
+
             cv2.putText(
                 frame,
                 f"ML Confidence: {ml_fall_prob * 100:.1f}%",
@@ -540,6 +738,31 @@ def process_frame(frame, include_frame=True):
                 1
             )
 
+            step_time = time.perf_counter() - step_start
+
+            if should_log_diagnostic:
+
+                diagnostic_log(
+                    f"FRAME {current_frame_number} | "
+                    f"STEP 6 drawing | {step_time:.4f}s"
+                )
+
+        # ====================================================
+        # STEP 7 — RETURN
+        # ====================================================
+
+        total_time = time.perf_counter() - total_start
+
+        if should_log_diagnostic:
+
+            diagnostic_log(
+                f"FRAME {current_frame_number} | "
+                f"STEP 7 COMPLETE | "
+                f"TOTAL={total_time:.4f}s | "
+                f"detection={detection} | "
+                f"person={person_detected} | "
+                f"buffer={len(frame_buffer)}/{SEQUENCE_LENGTH}"
+            )
 
         # ====================================================
         # RETURN RESULT
@@ -565,7 +788,9 @@ def process_frame(frame, include_frame=True):
 
             "fall_latched": fall_latched,
 
-            "model_prediction_updated": model_prediction_updated,
+            "model_prediction_updated": (
+                model_prediction_updated
+            ),
 
             "torso_angle": round(
                 torso_angle,
@@ -588,7 +813,11 @@ def process_frame(frame, include_frame=True):
 
             "landmarks": landmarks_for_browser,
 
-            "frame": frame if include_frame else None
+            "frame": (
+                frame
+                if include_frame
+                else None
+            )
         }
 
 
@@ -600,26 +829,46 @@ def reset_inference():
 
     global frame_buffer
     global head_y_history
+
     global fall_latched
     global fall_trigger_counter
     global heuristic_trigger_counter
+
     global alert_sent_for_current_fall
+
     global frames_since_model_prediction
     global model_prediction_count
+
     global last_ml_fall_prob
     global last_logged_buffer_size
+
+    global diagnostic_frame_counter
 
     with state_lock:
 
         frame_buffer = []
+
         head_y_history = []
 
         fall_latched = False
+
         fall_trigger_counter = 0
+
         heuristic_trigger_counter = 0
 
         alert_sent_for_current_fall = False
+
         frames_since_model_prediction = 0
+
         model_prediction_count = 0
+
         last_ml_fall_prob = 0.0
+
         last_logged_buffer_size = 0
+
+        diagnostic_frame_counter = 0
+
+    print(
+        "[INFERENCE] State reset successfully.",
+        flush=True
+    )
